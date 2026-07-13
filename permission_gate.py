@@ -613,6 +613,34 @@ def is_read_secret_path(text: str) -> bool:
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in _READ_SECRET_PATH_PATTERNS)
 
 
+def _get_project_slug(cwd: str) -> str:
+    """Convert a working directory path to the Claude Code project slug.
+
+    Claude Code encodes project paths by replacing every non-alphanumeric
+    character (/, ., _, spaces, non-ASCII, etc.) with '-'.  This matches the
+    JavaScript logic: path.replace(/[^a-zA-Z0-9]/g, "-")
+
+    /home/qyzhang                         → -home-qyzhang
+    /home/qyzhang/.claude/agent-permission-gate → -home-qyzhang--claude-agent-permission-gate
+    /home/qyzhang/table_research          → -home-qyzhang-table-research
+    """
+    return re.sub(r'[^a-zA-Z0-9]', '-', os.path.abspath(cwd))
+
+
+def _is_claude_projects_path(path: str, cwd: str) -> bool:
+    """Check if a file path falls under ~/.claude/projects/<project-slug>.
+
+    This identifies project-specific config, memory, and transcript files
+    that belong to the current workspace and should be readable.
+    """
+    if not cwd:
+        return False
+    project_slug = _get_project_slug(cwd)
+    projects_dir = os.path.expanduser(f"~/.claude/projects/{project_slug}")
+    expanded = os.path.abspath(os.path.expanduser(path))
+    return expanded.startswith(projects_dir + os.sep) or expanded == projects_dir
+
+
 def has_shell_control_operator(command: str) -> bool:
     return any(x in command for x in SHELL_CONTROL_PATTERNS)
 
@@ -669,7 +697,8 @@ def _extract_string_values(obj: Any) -> List[str]:
     return result
 
 
-def classify_builtin_read_tool(tool_name: str, tool_input: Dict[str, Any]) -> Tuple[Optional[str], str]:
+def classify_builtin_read_tool(tool_name: str, tool_input: Dict[str, Any],
+                               cwd: str = "") -> Tuple[Optional[str], str]:
     """
     Return:
       ("allow", reason), ("ask", reason), or (None, reason)
@@ -678,6 +707,13 @@ def classify_builtin_read_tool(tool_name: str, tool_input: Dict[str, Any]) -> Tu
         return None, "Not a read-only built-in tool."
 
     paths = _extract_string_values(tool_input)
+
+    # Allow reading project config/memory/transcript files under
+    # ~/.claude/projects/<project-slug> — these belong to the current workspace.
+    if cwd and any(_is_claude_projects_path(p, cwd) for p in paths):
+        if not any(is_read_secret_path(p) for p in paths):
+            return "allow", f"{tool_name} targeting project config path under ~/.claude/projects."
+
     if any(is_read_secret_path(p) for p in paths):
         return None, "Read-like tool targets a path that may contain secrets."
 
@@ -1131,6 +1167,7 @@ Return {"decision":"allow",...} only for clearly safe operations such as:
 
 ### File operations
 - Read/list/search non-sensitive files inside the working directory — always allow.
+- Read/list/search files under ~/.claude/projects/<project-slug> — always allow. These are project configuration, memory, and transcript files that belong to the current workspace.
 - Edit or write files inside the working directory for the current task.
 - Access files under /tmp.
 - Create temporary/cache/build artifacts inside the working directory.
@@ -1162,7 +1199,7 @@ Return {"decision":"ask",...} for any operation matching one or more of these ca
 ### Destructive or risky filesystem operations
 - Delete, remove, unlink, shred, wipe, truncate, or recursively overwrite files.
 - Move or rename files unless clearly local, reversible, and inside the working directory.
-- Write/edit outside the working directory, except /tmp.
+- Write/edit outside the working directory, except /tmp and ~/.claude/projects/<project-slug>.
 - Modify system paths such as /etc, /usr, /bin, /sbin, /var, /opt, /Library, C:\\Windows, or user shell config files.
 - Any path using traversal or unclear expansion that may escape the working directory.
 - Any operation involving symlinks where the target may be outside the working directory.
@@ -1303,6 +1340,7 @@ Return {"decision":"allow",...} ONLY for clearly read-only, non-sensitive operat
 
 ### File reading
 - Read files inside the working directory that are NOT known secret files (.env, id_rsa, .ssh/*, .aws/*, credentials.json, tokens, etc.).
+- Read files under ~/.claude/projects/<project-slug> — always allow. These are project configuration, memory, and transcript files belonging to the current workspace.
 - List/search/glob non-sensitive files (non-secret paths).
 
 ### Git read-only commands
@@ -1787,7 +1825,8 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
         return "ask", f"{tool_name} modifies files, not allowed in read-only mode."
 
     # 5. Read-only built-in tools.
-    builtin_decision, builtin_reason = classify_builtin_read_tool(tool_name, tool_input)
+    cwd = str(event.get("cwd", ""))
+    builtin_decision, builtin_reason = classify_builtin_read_tool(tool_name, tool_input, cwd=cwd)
     if builtin_decision:
         return builtin_decision, builtin_reason
 
